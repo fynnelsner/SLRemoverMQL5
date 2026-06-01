@@ -427,22 +427,79 @@ void RestoreSavedSLs()
    {
       if(records[i].restored) continue;
 
-      bool restoredOk=false;
-      ulong t=records[i].ticket;
-
-      if(PositionSelectByTicket(t))
+      ulong t = records[i].ticket;
+      if(!PositionSelectByTicket(t))
       {
-         string sym=PositionGetString(POSITION_SYMBOL);
-         double tp=PositionGetDouble(POSITION_TP);
-         // Restore original SL (even if it was 0)
-         restoredOk = trade.PositionModify(t, records[i].originalSL, tp);
+         PrintFormat("Position closed before restore, ticket=%I64u", t);
+         records[i].restored = true; // nothing to restore
+         UpdateLogRow(records[i]);
+         continue;
       }
 
-      if(restoredOk)
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double tp  = PositionGetDouble(POSITION_TP);
+      double originalSL = records[i].originalSL;
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      double currentPrice = (posType == POSITION_TYPE_BUY)
+                            ? SymbolInfoDouble(sym, SYMBOL_BID)
+                            : SymbolInfoDouble(sym, SYMBOL_ASK);
+      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+      long stopsLevel = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+      double minDist  = stopsLevel * point;
+      int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+
+      double safeSL = originalSL;
+      bool canRestore = true;
+
+      // If original SL was 0 (no SL), we can always restore to 0
+      if(originalSL != 0.0)
       {
-         PrintFormat("Restored SL for %s ticket=%I64u", records[i].symbol, records[i].ticket);
+         if(posType == POSITION_TYPE_BUY)
+         {
+            // SL must be below current price, otherwise immediate trigger
+            if(originalSL >= currentPrice - minDist)
+            {
+               PrintFormat("SKIP restore for %s ticket=%I64u: originalSL=%s >= currentPrice=%s (would trigger immediately)",
+                           sym, t,
+                           DoubleToString(originalSL, digits),
+                           DoubleToString(currentPrice, digits));
+               canRestore = false;
+            }
+         }
+         else // SELL
+         {
+            // SL must be above current price, otherwise immediate trigger
+            if(originalSL <= currentPrice + minDist)
+            {
+               PrintFormat("SKIP restore for %s ticket=%I64u: originalSL=%s <= currentPrice=%s (would trigger immediately)",
+                           sym, t,
+                           DoubleToString(originalSL, digits),
+                           DoubleToString(currentPrice, digits));
+               canRestore = false;
+            }
+         }
+      }
+
+      if(!canRestore)
+      {
+         // Mark as restored (skipped) so we don't try again every tick
+         records[i].restored = true;
+         records[i].restoredTime = TimeCurrent();
+         UpdateLogRow(records[i]);
+         continue;
+      }
+
+      if(trade.PositionModify(t, safeSL, tp))
+      {
+         PrintFormat("Restored SL for %s ticket=%I64u SL=%s", sym, t,
+                     (safeSL > 0 ? DoubleToString(safeSL, digits) : "NONE"));
          records[i].restored     = true;
          records[i].restoredTime = TimeCurrent();
+      }
+      else
+      {
+         PrintFormat("FAILED restore SL for %s ticket=%I64u err=%d", sym, t, GetLastError());
       }
 
       UpdateLogRow(records[i]);
